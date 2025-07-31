@@ -59,6 +59,8 @@ Route::middleware(['auth', 'verified'])->group(function () {
 
     // Documents
     Route::resource('documents', LegalDocumentController::class);
+    Route::post('/chat/generate-content', [LegalChatController::class, 'generateContent']);
+    Route::post('/documents/save-generated', [LegalChatController::class, 'saveGeneratedDocument']);
 
     // Tasks
     Route::get('/tasks/calendar', [TaskController::class, 'calendar'])->name('tasks.calendar');
@@ -83,6 +85,43 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
     Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
     Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+
+    // Knowledge Base Routes
+    Route::prefix('knowledge-base')->name('knowledge-base.')->group(function () {
+        Route::get('/', [KnowledgeBaseController::class, 'index'])
+            ->name('index');
+
+        Route::get('/{entry}', [KnowledgeBaseController::class, 'show'])
+            ->name('show');
+
+        Route::post('/precedent', [KnowledgeBaseController::class, 'createPrecedent'])
+            ->name('precedent.store');
+
+        Route::put('/{entry}', [KnowledgeBaseController::class, 'update'])
+            ->name('update');
+
+        Route::delete('/{entry}', [KnowledgeBaseController::class, 'destroy'])
+            ->name('destroy');
+
+        Route::get('/{entry}/related', [KnowledgeBaseController::class, 'getRelated'])
+            ->name('related');
+    });
+
+    // Notification Routes
+    Route::prefix('notifications')->name('notifications.')->group(function () {
+        Route::get('/', [NotificationController::class, 'index'])
+            ->name('index');
+
+        Route::post('/mark-read', [NotificationController::class, 'markAsRead'])
+            ->name('mark-read');
+
+        Route::post('/mark-all-read', [NotificationController::class, 'markAllAsRead'])
+            ->name('mark-all-read');
+
+        Route::get('/stats', [NotificationController::class, 'getStats'])
+            ->name('stats');
+    });
+
 });
 
 require __DIR__.'/auth.php';

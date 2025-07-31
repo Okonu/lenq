@@ -3,12 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Models\Conversation;
+use App\Models\FirmMember;
+use App\Models\GeneratedDocument;
 use App\Models\LegalCase;
 use App\Models\LegalDocument;
 use App\Models\Message;
 use App\Services\PythonApiService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Inertia\Inertia;
 
@@ -124,7 +127,6 @@ class LegalChatController extends Controller
                 'title' => $document->title
             ]);
 
-            // Verify the document is accessible in the Python API's file storage
             $pythonApiPath = null;
             if (!empty($document->api_document_id)) {
                 // Extract the filename from api_document_id (format: doc_filename.pdf)
@@ -162,7 +164,6 @@ class LegalChatController extends Controller
                 ];
             })->toArray();
 
-            // Prepare document content if needed
             $documentContent = null;
             if ($document) {
                 $documentContent = [
@@ -179,7 +180,6 @@ class LegalChatController extends Controller
                 ]);
             }
 
-            // Use the pythonApiService to send the chat request
             $response = $this->pythonApiService->chat(
                 $request->message,
                 $context,
@@ -253,7 +253,6 @@ class LegalChatController extends Controller
             if ($response->successful() && !$response->json('error')) {
                 $apiResponse = $response->json();
 
-                // Extract the document ID from the API response
                 $apiDocumentId = null;
                 if (isset($apiResponse['document']) && isset($apiResponse['document']['id'])) {
                     $apiDocumentId = $apiResponse['document']['id'];
@@ -271,7 +270,7 @@ class LegalChatController extends Controller
                     'file_path' => $path,
                     'type' => $request->type,
                     'analysis' => null,
-                    'api_document_id' => $apiDocumentId,  // Save the API document ID
+                    'api_document_id' => $apiDocumentId,
                 ]);
 
                 \Log::info('Document created in database', [
@@ -379,10 +378,6 @@ class LegalChatController extends Controller
 
     private function generateTitle($userMessage, $aiResponse)
     {
-        // Simple fallback title generation if the API doesn't provide one
-        // In a real implementation, this would use more sophisticated NLP
-
-        // Extract first few words from user message (up to 3 words)
         $words = explode(' ', $userMessage);
         $titleWords = array_slice($words, 0, 3);
         $title = implode(' ', $titleWords);
@@ -456,6 +451,318 @@ class LegalChatController extends Controller
         return redirect()->route('chat.show', $conversation->id);
     }
 
+    /**
+     * Generate document content (client-side download)
+     */
+    public function generateContent(Request $request)
+    {
+        $request->validate([
+            'document_type' => 'required|in:contract,agreement,letter,memo,brief,motion,general',
+            'instructions' => 'required|string|min:10|max:2000',
+            'conversation_id' => 'sometimes|exists:conversations,id',
+            'case_id' => 'sometimes|exists:legal_cases,id',
+            'title' => 'sometimes|string|max:255',
+        ]);
+
+        try {
+            // Build prompt for AI
+            $prompt = $this->buildDocumentPrompt(
+                $request->document_type,
+                $request->instructions,
+                $request->conversation_id,
+                $request->case_id
+            );
+
+            // Call your Python API for content generation
+            $response = $this->pythonApiService->generateDocumentContent([
+                'document_type' => $request->document_type,
+                'instructions' => $request->instructions,
+                'prompt' => $prompt,
+                'conversation_context' => $this->getConversationContext($request->conversation_id),
+                'case_context' => $this->getCaseContext($request->case_id),
+            ]);
+
+            if (!$response->successful()) {
+                // Try alternative method using chat endpoint
+                $response = $this->pythonApiService->generateDocumentUsingChat([
+                    'document_type' => $request->document_type,
+                    'instructions' => $request->instructions,
+                    'prompt' => $prompt,
+                ]);
+            }
+
+            if (!$response->successful()) {
+                throw new \Exception('AI service failed to generate content');
+            }
+
+            $aiResponse = $response->json();
+
+            return response()->json([
+                'success' => true,
+                'content' => $aiResponse['content'] ?? $aiResponse['response'],
+                'title' => $request->title ?: $this->generateDocumentTitle($request->document_type, $request->instructions),
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Document content generation failed', [
+                'error' => $e->getMessage(),
+                'user_id' => auth()->id(),
+                'document_type' => $request->document_type,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to generate content: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Save generated document record (after client download)
+     */
+    public function saveGeneratedDocument(Request $request)
+    {
+        $request->validate([
+            'conversation_id' => 'sometimes|exists:conversations,id',
+            'legal_case_id' => 'sometimes|exists:legal_cases,id',
+            'type' => 'required|in:contract,agreement,letter,memo,brief,motion,general',
+            'title' => 'required|string|max:255',
+            'content' => 'required|string',
+            'instructions' => 'required|string',
+            'format' => 'required|in:pdf,docx,html',
+        ]);
+
+        try {
+            $firmMember = FirmMember::where('user_id', auth()->id())->first();
+
+            if (!$firmMember) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'User not associated with any firm'
+                ], 403);
+            }
+
+            $document = GeneratedDocument::create([
+                'user_id' => auth()->id(),
+                'law_firm_id' => $firmMember->law_firm_id,
+                'conversation_id' => $request->conversation_id,
+                'legal_case_id' => $request->legal_case_id,
+                'title' => $request->title,
+                'type' => $request->type,
+                'format' => $request->format,
+                'generation_prompt' => $request->instructions,
+                'content' => $request->content,
+                'downloaded_at' => now(),
+                'download_count' => 1,
+                'generation_metadata' => [
+                    'generated_at' => now(),
+                    'client_generated' => true,
+                    'ip_address' => $request->ip(),
+                    'user_agent' => $request->userAgent(),
+                ],
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'document' => $document->load(['conversation', 'legalCase']),
+                'message' => 'Document record saved successfully',
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Failed to save generated document record', [
+                'error' => $e->getMessage(),
+                'user_id' => auth()->id(),
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to save document record',
+            ], 500);
+        }
+    }
+
+    /**
+     * Track document download/regeneration
+     */
+    public function trackDocumentDownload(GeneratedDocument $document, Request $request)
+    {
+        if ($document->user_id !== auth()->id()) {
+            abort(403);
+        }
+
+        $request->validate([
+            'format' => 'sometimes|in:pdf,docx,html',
+        ]);
+
+        try {
+            // Update download tracking
+            $document->increment('download_count');
+            $document->update([
+                'downloaded_at' => now(),
+                'format' => $request->format ?? $document->format,
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Download tracked',
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to track download',
+            ], 500);
+        }
+    }
+
+    /**
+     * Get generated documents for conversation/case
+     */
+    public function getGeneratedDocuments(Request $request)
+    {
+        $request->validate([
+            'conversation_id' => 'sometimes|exists:conversations,id',
+            'legal_case_id' => 'sometimes|exists:legal_cases,id',
+            'type' => 'sometimes|in:contract,agreement,letter,memo,brief,motion,general',
+            'limit' => 'sometimes|integer|min:1|max:50',
+        ]);
+
+        try {
+            $query = GeneratedDocument::where('user_id', auth()->id())
+                ->with(['conversation:id,title', 'legalCase:id,title'])
+                ->orderBy('created_at', 'desc');
+
+            if ($request->conversation_id) {
+                $query->where('conversation_id', $request->conversation_id);
+            }
+
+            if ($request->legal_case_id) {
+                $query->where('legal_case_id', $request->legal_case_id);
+            }
+
+            if ($request->type) {
+                $query->where('type', $request->type);
+            }
+
+            $documents = $query->limit($request->input('limit', 20))->get();
+
+            return response()->json([
+                'success' => true,
+                'documents' => $documents,
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to get documents',
+            ], 500);
+        }
+    }
+
+    /**
+     * Build document generation prompt
+     */
+    private function buildDocumentPrompt(string $type, string $instructions, ?int $conversationId = null, ?int $caseId = null): string
+    {
+        $prompt = "Generate a professional {$type} based on these instructions:\n\n{$instructions}\n\n";
+
+        // Add type-specific requirements
+        $typePrompts = [
+            'contract' => "Include standard legal clauses, clear terms, parties, consideration, obligations, and termination provisions.",
+            'agreement' => "Structure with clear definitions, scope of work, deliverables, payment terms, and dispute resolution.",
+            'letter' => "Format as professional legal correspondence with proper letterhead structure and formal tone.",
+            'memo' => "Structure as legal memorandum with: Issue, Brief Answer, Facts, Discussion, and Conclusion.",
+            'brief' => "Create legal brief with case citations, legal arguments, and proper court formatting.",
+            'motion' => "Draft court motion with proper caption, background facts, legal standard, argument, and relief requested.",
+        ];
+
+        $prompt .= $typePrompts[$type] ?? "Create a well-structured professional legal document.";
+
+        // Add context from conversation/case if available
+        if ($conversationId) {
+            $conversation = Conversation::find($conversationId);
+            if ($conversation) {
+                $recentMessages = $conversation->messages()
+                    ->latest()
+                    ->limit(3)
+                    ->get();
+
+                if ($recentMessages->isNotEmpty()) {
+                    $prompt .= "\n\nContext from recent conversation:\n";
+                    foreach ($recentMessages as $message) {
+                        $snippet = substr($message->content, 0, 100);
+                        $sender = $message->is_user ? 'User' : 'Assistant';
+                        $prompt .= "- {$sender}: {$snippet}...\n";
+                    }
+                }
+            }
+        }
+
+        if ($caseId) {
+            $case = LegalCase::find($caseId);
+            if ($case) {
+                $prompt .= "\n\nCase Context:\n";
+                $prompt .= "- Case: {$case->title}\n";
+                if ($case->jurisdiction) {
+                    $prompt .= "- Jurisdiction: {$case->jurisdiction}\n";
+                }
+                if ($case->case_number) {
+                    $prompt .= "- Case Number: {$case->case_number}\n";
+                }
+            }
+        }
+
+        $prompt .= "\n\nEnsure the document is professional, legally sound, and ready for use.";
+
+        return $prompt;
+    }
+
+    /**
+     * Get conversation context for document generation
+     */
+    private function getConversationContext(?int $conversationId): ?array
+    {
+        if (!$conversationId) return null;
+
+        $conversation = Conversation::find($conversationId);
+        if (!$conversation) return null;
+
+        $messages = $conversation->messages()
+            ->orderBy('created_at', 'desc')
+            ->limit(5)
+            ->get();
+
+        return [
+            'recent_messages' => $messages->map(function ($message) {
+                return [
+                    'is_user' => $message->is_user,
+                    'content' => substr($message->content, 0, 200),
+                    'created_at' => $message->created_at,
+                ];
+            })->toArray(),
+            'message_count' => $conversation->messages()->count(),
+        ];
+    }
+
+    /**
+     * Get case context for document generation
+     */
+    private function getCaseContext(?int $caseId): ?array
+    {
+        if (!$caseId) return null;
+
+        $case = LegalCase::find($caseId);
+        if (!$case) return null;
+
+        return [
+            'title' => $case->title,
+            'jurisdiction' => $case->jurisdiction,
+            'case_number' => $case->case_number,
+            'status' => $case->status,
+            'category' => $case->category,
+            'description' => substr($case->description, 0, 500),
+        ];
+    }
     public function destroy(Conversation $conversation)
     {
         if ($conversation->user_id !== auth()->id()) {
